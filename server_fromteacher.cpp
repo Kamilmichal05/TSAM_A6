@@ -48,9 +48,12 @@ class Client
   public:
     int sock;              // socket of client connection
     std::string name;           // Limit length of name of client's user
+    std::string receive_Buffer;
+    std::string send_Buffer;
+    int length_read = 0;
+    uint16_t message_length = 0;
 
     Client(int socket) : sock(socket){} 
-
     ~Client(){}            // Virtual destructor defined for base class
 };
 
@@ -170,7 +173,7 @@ bool sendMessage(int sock, const std::string &msg)
 // Process command from client on the server
 
 void clientCommand(int clientSocket, std::vector<struct pollfd> *fds,
-                  char *buffer) 
+                  const char *buffer) 
 {
   std::vector<std::string> tokens;
   std::string token;
@@ -178,14 +181,14 @@ void clientCommand(int clientSocket, std::vector<struct pollfd> *fds,
   // Split command from client into tokens for parsing
   std::stringstream stream(buffer);
 
-  while(stream >> token)
-      tokens.push_back(token);
+  while (std::getline(stream, token, ','))
+    tokens.push_back(token);
 
-  if((tokens[0].compare("CONNECT") == 0) && (tokens.size() == 2))
+  if((tokens[0].compare("SENDMSG") == 0) && (tokens.size() == 2))
   {
      clients[clientSocket]->name = tokens[1];
   }
-  else if(tokens[0].compare("LEAVE") == 0)
+  else if(tokens[0].compare("GETMSG") == 0)
   {
       // Close the socket, and leave the socket handling
       // code to deal with tidying up clients etc. when
@@ -193,7 +196,7 @@ void clientCommand(int clientSocket, std::vector<struct pollfd> *fds,
  
       closeClient(clientSocket, fds);
   }
-  else if(tokens[0].compare("WHO") == 0)
+  else if(tokens[0].compare("STATUSREQ") == 0)
   {
      std::cout << "Who is logged on" << std::endl;
      std::string msg;
@@ -323,7 +326,6 @@ int main(int argc, char* argv[])
                }
 
                // Decrement the number of sockets waiting to be dealt with
-               n--;
 
                printf("Client connected on server: %d\n", clientSock);
             }
@@ -336,20 +338,45 @@ int main(int argc, char* argv[])
                   {
                       int sock = readyFds[i].fd;
                       Client *client = clients[sock];
+                      ssize_t bytes_received = recv(sock, buffer, sizeof(buffer), MSG_DONTWAIT);
 
                       // recv() == 0 means client has closed connection
-                      if(recv(sock, buffer, sizeof(buffer), MSG_DONTWAIT) == 0)
+                      if(bytes_received == 0)
                       {
                           disconnectedClients.push_back(client);
                           closeClient(sock, &fds);
 
                       }
+
+                      else if (bytes_received == -1) {
+                        closeClient(sock,&fds);
+                      }
                       // We don't check for -1 (nothing received) because poll()
                       // only triggers if there is something on the socket for us.
                       else
                       {
-                          std::cout << buffer << std::endl;
-                          clientCommand(sock, &fds, buffer);
+
+                        client->receive_Buffer.append(buffer, bytes_received);
+
+                        if (client->receive_Buffer.size() >= 3 && client->length_read == 0) {
+                            uint16_t netLen;
+                            memcpy(&netLen, client->receive_Buffer.data() + 1, 2);
+                            client->message_length = ntohs(netLen);
+                            client->length_read = 1;
+                        }
+
+                        if (client->length_read == 1 && client->receive_Buffer.size() >= client->message_length) {
+                            
+                            
+                            std::string new_command = client->receive_Buffer.substr(4, client->message_length - 5);
+                            client->receive_Buffer.erase(0, client->message_length);
+                            client->message_length = 0;
+                            client->length_read = 0;
+                            clientCommand(sock, &fds, new_command.data());
+                        }
+    
+                        
+
                       }
                   }
                }
