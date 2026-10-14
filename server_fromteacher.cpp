@@ -24,7 +24,6 @@
 #include <vector>
 #include <list>
 #include <poll.h>
-
 #include <iostream>
 #include <sstream>
 #include <thread>
@@ -43,6 +42,15 @@
 // Simple class for handling connections from clients.
 //
 // Client(int socket) - socket to send/receive traffic from client.
+
+
+struct MessageFrom {
+    std::string text;
+    std::string from;
+};
+
+std::map<std::string,std::vector<MessageFrom>> mails;
+
 class Client
 {
   public:
@@ -149,23 +157,45 @@ void closeClient(int clientSocket, std::vector<struct pollfd> *fds)
 //
 // Returns false if the client has gone away.
 
-bool sendMessage(int sock, const std::string &msg)
+std::string building_message(std::string text) {
+
+    size_t length = text.size() + 5;
+    uint16_t totallen = htons(length);
+    std::string frame;
+    frame += "\x01";
+    frame.append(reinterpret_cast<const char*>(&totallen), 2);
+    frame += '\x02';
+    frame += text;
+    frame += '\x03';
+    return frame;
+}
+
+bool sendMessage(int sock, std::string mytext)
 {
-   const char *p    = msg.c_str();
-   size_t remaining = msg.length();
+    std::string frame = building_message(mytext);
 
-   while(remaining > 0)
-   {
-      int n = send(sock, p, remaining, MSG_DONTWAIT);
+    ssize_t left_bytes = send(sock,frame.data(), frame.size(),0);
 
-      if(n == 0)        // client is gone
-      {
-         return false;
-      }
+    if (left_bytes == -1) {
+        return false;
+    }
 
-      p         += n;
-      remaining -= n;
-   }
+    const char* data_location = frame.data();
+    size_t bytes_remaining = frame.size();
+
+    while(bytes_remaining < 0)
+    {
+        ssize_t n = send(sock, data_location, bytes_remaining, 0);
+
+        if(n > 0)
+        {
+            data_location += n;
+            bytes_remaining -= static_cast<size_t>(n);
+        }
+        else {
+            return false;
+        }
+    }
 
    return true;
 }
@@ -175,6 +205,7 @@ bool sendMessage(int sock, const std::string &msg)
 void clientCommand(int clientSocket, std::vector<struct pollfd> *fds,
                   const char *buffer) 
 {
+
   std::vector<std::string> tokens;
   std::string token;
 
@@ -186,61 +217,79 @@ void clientCommand(int clientSocket, std::vector<struct pollfd> *fds,
 
   if((tokens[0].compare("SENDMSG") == 0) && (tokens.size() == 2))
   {
-     clients[clientSocket]->name = tokens[1];
+    std::string from = tokens[1];
+    std::string to = tokens[2];
+    std::string body = tokens[3]; 
+    std::string message;
+
+    if (tokens.size() < 4) {
+        return;
+    }
+
+    else {
+
+        for (size_t i = 4; i < tokens.size(); i++)
+        {
+            body+= "," + tokens[i];
+        }
+    }
+
+    mails[to].push_back(MessageFrom{body, from});
+    std::string status = "successful";
+    sendMessage(clientSocket,status);
   }
   else if(tokens[0].compare("GETMSG") == 0)
   {
-      // Close the socket, and leave the socket handling
-      // code to deal with tidying up clients etc. when
-      // poll() detects the OS has torn down the connection.
- 
-      closeClient(clientSocket, fds);
+
+    std::string name = tokens[1];
+    auto mail = mails.find(name);
+
+    if (mail->second.empty() || mail == mails.end()) {
+        return;
+    }
+
+    std::string singe_message = mail->second.front().text;
+    mail->second.erase(mail->second.begin());
+    sendMessage(clientSocket,singe_message);
+
+
   }
   else if(tokens[0].compare("STATUSREQ") == 0)
   {
-     std::cout << "Who is logged on" << std::endl;
-     std::string msg;
+     
+    int count = 0;
+    int empty = 0;
+    std::string temp;
+    for (auto data : mails) {
 
-     for(auto const& names : clients)
-     {
-        msg += names.second->name + ",";
+        if (data.second.empty()) {
+            continue;
+        }
+        else {
+            empty = 1;
+        }
 
-     }
-     // Reducing the msg length by 1 loses the excess "," - which
-     // granted is totally cheating.
-     send(clientSocket, msg.c_str(), msg.length()-1, 0);
+        size_t our_size = data.second.size();
+        std::string name = data.first;
+        temp += name;
+        temp += ":";
+        temp += std::to_string(our_size);
+        temp += ",";
+        count++;
+    }
 
-  }
-  // This is slightly fragile, since it's relying on the order
-  // of evaluation of the if statement.
-  else if((tokens[0].compare("MSG") == 0) && (tokens[1].compare("ALL") == 0))
-  {
-      std::string msg;
-      for(auto i = tokens.begin()+2;i != tokens.end();i++) 
-      {
-          msg += *i + " ";
-      }
+    if (empty == 0) {
+        temp = "EMPTY";
+    }
 
-      for(auto const& pair : clients)
-      {
-          sendMessage(pair.second->sock, msg);
-      }
-  }
-  else if(tokens[0].compare("MSG") == 0)
-  {
-      for(auto const& pair : clients)
-      {
-          if(pair.second->name.compare(tokens[1]) == 0)
-          {
-              std::string msg;
-              for(auto i = tokens.begin()+2;i != tokens.end();i++) 
-              {
-                  msg += *i + " ";
-              }
-              sendMessage(pair.second->sock, msg);
-          }
-      }
-  }
+    if (count > 0 && temp != "EMPTY") {
+        temp.pop_back();
+    }
+    sendMessage(clientSocket,temp);
+}
+
+ 
+  
   else
   {
       std::cout << "Unknown command from client:" << buffer << std::endl;
@@ -372,11 +421,15 @@ int main(int argc, char* argv[])
                             client->receive_Buffer.erase(0, client->message_length);
                             client->message_length = 0;
                             client->length_read = 0;
-                            clientCommand(sock, &fds, new_command.data());
-                        }
-    
-                        
 
+                            if (client->message_length > 5005) {
+                                continue;
+                            }
+                            else {
+                                clientCommand(sock, &fds, new_command.data());
+                            }
+                            
+                        }
                       }
                   }
                }
